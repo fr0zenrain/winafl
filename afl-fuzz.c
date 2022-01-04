@@ -149,7 +149,7 @@ PDH_HQUERY cpuQuery;
 PDH_HCOUNTER cpuTotal;
 
 u8* trace_bits;                       /* SHM with instrumentation bitmap  */
-
+char *target_module;
 static u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
            virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
@@ -1526,7 +1526,7 @@ static void setup_shm(void) {
   if(attempts == 5) {
     FATAL("Could not find a section name.\n");
   }
-
+  _putenv_s(SHM_ENV_VAR, shm_str);
   atexit(remove_shm);
 
   ck_free(shm_str);
@@ -2270,6 +2270,9 @@ char *argv_to_cmd(char** argv) {
   u8* buf, *ret;
 
   //todo shell-escape
+  if (!strcmp(argv[0], "--")) {
+	  argv++;
+  }
 
   for (i = 0; argv[i]; i++)
     len += ArgvQuote(argv[i], NULL) + 1;
@@ -2429,7 +2432,7 @@ static void create_target_process(char** argv) {
     pipe_name,                // pipe name
     PIPE_ACCESS_DUPLEX |      // read/write access 
     FILE_FLAG_OVERLAPPED,     // overlapped mode 
-    0,
+    PIPE_WAIT,
     1,                        // max. instances
     512,                      // output buffer size
     512,                      // input buffer size
@@ -2439,7 +2442,7 @@ static void create_target_process(char** argv) {
   if (pipe_handle == INVALID_HANDLE_VALUE) {
     FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
   }
-
+  _putenv_s(PIPE_ENV_VAR, pipe_name);
   target_cmd = argv_to_cmd(argv);
 
   ZeroMemory(&si, sizeof(si));
@@ -2453,42 +2456,6 @@ static void create_target_process(char** argv) {
     inherit_handles = FALSE;
   }
 
-  if (expert_mode) {
-    client_invocation = alloc_printf("-t winafl");
-  } else {
-    client_invocation = alloc_printf("-c %s", winafl_dll_path);
-  }
-
-  if(drioless) {
-    char *static_config = alloc_printf("%s:%d", fuzzer_id, fuzz_iterations_max);
-
-    if (static_config == NULL) {
-      FATAL("Cannot allocate static_config.");
-    }
-
-    SetEnvironmentVariable("AFL_STATIC_CONFIG", static_config);
-    cmd = alloc_printf("%s", target_cmd);
-    ck_free(static_config);
-  }
-  else {
-    if (drattach) {
-      drattachpid = find_attach_pid(drattach_identifier);
-      cmd = alloc_printf(
-        "%s\\drrun.exe -attach %ld -no_follow_children %s %s -fuzzer_id %s",
-        dynamorio_dir, drattachpid, client_invocation, client_params, fuzzer_id);
-    } else {
-      pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
-      if (persist_dr_cache) {
-        cmd = alloc_printf(
-          "%s\\drrun.exe -pidfile %s -no_follow_children -persist -persist_dir \"%s\\drcache\" %s %s -fuzzer_id %s -drpersist -- %s",
-          dynamorio_dir, pidfile, out_dir, client_invocation, client_params, fuzzer_id, target_cmd);
-      } else {
-        cmd = alloc_printf(
-          "%s\\drrun.exe -pidfile %s -no_follow_children %s %s -fuzzer_id %s -- %s",
-          dynamorio_dir, pidfile, client_invocation, client_params, fuzzer_id, target_cmd);
-      }
-    }
-  }
   if(mem_limit || cpu_aff) {
     hJob = CreateJobObject(NULL, NULL);
     if(hJob == NULL) {
@@ -2516,7 +2483,7 @@ static void create_target_process(char** argv) {
     }
   }
 
-  if(!CreateProcess(NULL, cmd, NULL, NULL, inherit_handles, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+  if(!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
     FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
   }
 
@@ -2540,45 +2507,9 @@ static void create_target_process(char** argv) {
   }
 
   watchdog_enabled = 0;
+  child_pid = pi.dwProcessId;
 
-  if (drattach) {
-    child_pid = drattachpid;
-
-    CloseHandle(child_handle);
-    child_handle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, child_pid);
-    if (child_handle == NULL)
-    {
-      FATAL("OpenProcess failed, GLE=%d.\n", GetLastError());
-    }
-
-    CloseHandle(child_thread_handle);
-    child_thread_handle = NULL;
-  }
-  else if (drioless == 0) {
-    //by the time pipe has connected the pidfile must have been created
-    fp = fopen(pidfile, "rb");
-    if(!fp) {
-      FATAL("Error opening pidfile.txt");
-    }
-    fseek(fp,0,SEEK_END);
-    pidsize = ftell(fp);
-    fseek(fp,0,SEEK_SET);
-    buf = (char *)malloc(pidsize+1);
-    fread(buf, pidsize, 1, fp);
-    buf[pidsize] = 0;
-    fclose(fp);
-    remove(pidfile);
-    child_pid = atoi(buf);
-    free(buf);
-    ck_free(pidfile);
-  }
-  else {
-    child_pid = pi.dwProcessId;
-  }
-
-  ck_free(client_invocation);
   ck_free(target_cmd);
-  ck_free(cmd);
   ck_free(pipe_name);
 }
 
@@ -2591,38 +2522,12 @@ static void destroy_target_process(int wait_exit) {
 
 	EnterCriticalSection(&critical_section);
 
-  if (drattach) {
-    // reset the attach pid for next round
-    drattachpid = 0;
-  }
-
 	if (!child_handle) {
 		goto leave;
 	}
 
 	if (WaitForSingleObject(child_handle, wait_exit) != WAIT_TIMEOUT) {
 		goto done;
-	}
-
-	// nudge the child process only if dynamorio is used
-	if (drioless) {
-		TerminateProcess(child_handle, 0);
-	}
-	else {
-		kill_cmd = alloc_printf("%s\\drconfig.exe -nudge_pid %d 0 1", dynamorio_dir, child_pid);
-
-		ZeroMemory(&si, sizeof(si));
-		si.cb = sizeof(si);
-		ZeroMemory(&pi, sizeof(pi));
-
-		if (!CreateProcess(NULL, kill_cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-			FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
-		}
-
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-
-		ck_free(kill_cmd);
 	}
 
 	still_alive = WaitForSingleObject(child_handle, 2000) == WAIT_TIMEOUT;
@@ -2819,42 +2724,12 @@ static int process_test_case_into_dll(int fuzz_iterations)
    information. The called program will update trace_bits[]. */
 
 static u8 run_target(char** argv, u32 timeout) {
-	total_execs++;
-
-    if (dll_run_target_ptr) {
-      return dll_run_target_ptr(argv, timeout, trace_bits, MAP_SIZE);
-    }
-
-#ifdef INTELPT
-	if (use_intelpt) {
-		return run_target_pt(argv, timeout);
-	}
-#endif
-
+	
   //todo watchdog timer to detect hangs
   DWORD num_read, dwThreadId;
   char result = 0;
-  
- 
-  if(sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
-    devnul_handle = CreateFile(
-        "nul",
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL);
-
-    if(devnul_handle == INVALID_HANDLE_VALUE) {
-      PFATAL("Unable to open the nul device.");
-    }
-  }
-
-  if (dll_init_ptr) {
-    if (!dll_init_ptr())
-      PFATAL("User-defined custom initialization routine returned 0");
-  }
+  char command[] = "R";
+  child_timed_out = 0;
 
   if(!is_child_running()) {
     destroy_target_process(0);
@@ -2862,12 +2737,15 @@ static u8 run_target(char** argv, u32 timeout) {
     fuzz_iterations_current = 0;
   }
 
-  if (dll_run_ptr)
-    process_test_case_into_dll(fuzz_iterations_current);
-
-  child_timed_out = 0;
   memset(trace_bits, 0, MAP_SIZE);
   MemoryBarrier();
+  WriteFile(
+	  pipe_handle,    // handle to pipe
+	  command,		// buffer to write from
+	  1,				// number of bytes to write
+	  &num_read,		// number of bytes written
+	  NULL);			// not overlapped I/O
+
   if (fuzz_iterations_current == 0 && init_tmout != 0) {
 	  watchdog_timeout_time = get_cur_time() + init_tmout;
   }
@@ -2876,27 +2754,7 @@ static u8 run_target(char** argv, u32 timeout) {
   }
   watchdog_enabled = 1;
   result = ReadCommandFromPipe(timeout);
-  if (result == 'K')
-  {
-	  //a workaround for first cycle in app persistent mode
-	  result = ReadCommandFromPipe(timeout);
-  }
-  if (result == 0) 
-  {
-	  //saves us from getting stuck in corner case.
-	  MemoryBarrier();
-	  watchdog_enabled = 0;
 
-      destroy_target_process(0);
-      return FAULT_TMOUT;
-  }
-  if (result != 'P')
-  {
-	  FATAL("Unexpected result from pipe! expected 'P', instead received '%c'\n", result);
-  }
-  WriteCommandToPipe('F');
-
-  result = ReadCommandFromPipe(timeout); //no need to check for "error(0)" since we are exiting anyway
   //ACTF("result: '%c'", result);
   MemoryBarrier();
   watchdog_enabled = 0;
@@ -2906,7 +2764,7 @@ static u8 run_target(char** argv, u32 timeout) {
 #else
   classify_counts((u32*)trace_bits);
 #endif /* ^_WIN64 */
-
+  total_execs++;
   fuzz_iterations_current++;
 
   if(fuzz_iterations_current == fuzz_iterations_max) {
@@ -2916,14 +2774,13 @@ static u8 run_target(char** argv, u32 timeout) {
   if (result == 'K') return FAULT_NONE;
 
   if (result == 'C') {
-	  ret_exception_code = ReadDWORDFromPipe(timeout);
 	 // ACTF("destroying target process");
 	  destroy_target_process(2000);
 	  return FAULT_CRASH;
   }
-
+  if (child_timed_out) return FAULT_TMOUT;
   destroy_target_process(0);
-  return FAULT_TMOUT;
+  return FAULT_NONE;
 }
 
 
@@ -7999,57 +7856,6 @@ static void save_cmdline(u32 argc, char** argv) {
 static int optind;
 static char *optarg;
 
-static void extract_client_params(u32 argc, char** argv) {
-  u32 len = 1, i;
-  u32 nclientargs = 0;
-  u8* buf;
-  u32 opt_start, opt_end;
-
-  if(!argv[optind] || optind >= argc) usage(argv[0]);
-  if(strcmp(argv[optind],"--")) usage(argv[0]);
-
-  optind++;
-  opt_start = optind;
-
-  for (i = optind; i < argc; i++) {
-    if(strcmp(argv[i],"--") == 0) break;
-    nclientargs++;
-    len += strlen(argv[i]) + 1;
-  }
-
-  if(i == argc) usage(argv[0]);
-  opt_end = i;
-
-  buf = client_params = ck_alloc(len);
-
-  for (i = opt_start; i < opt_end; i++) {
-
-    u32 l = strlen(argv[i]);
-
-    memcpy(buf, argv[i], l);
-    buf += l;
-
-    *(buf++) = ' ';
-  }
-
-  if(buf != client_params) {
-    buf--;
-  }
-
-  *buf = 0;
-
-  optind = opt_end;
-
-  //extract the number of fuzz iterations from client params
-  fuzz_iterations_max = 1000;
-  for (i = opt_start; i < opt_end; i++) {
-    if((strcmp(argv[i], "-fuzz_iterations") == 0) && ((i + 1) < opt_end)) {
-      fuzz_iterations_max = atoi(argv[i+1]);
-    }
-  }
-
-}
-
 
 //extracts client and target command line params
 /*static void parse_cmd_line(char *argv0) {
@@ -8175,7 +7981,7 @@ int main(int argc, char** argv) {
   client_params = NULL;
   winafl_dll_path = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:sdYnCB:S:M:x:QD:b:l:pPc:w:A:eV")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:sdYnCB:S:M:x:QD:b:l:p:Pc:w:A:eV:")) > 0)
 
     switch (opt) {
       case 's':
@@ -8380,18 +8186,11 @@ int main(int argc, char** argv) {
 
         break;
 
-	  case 'p':
-		  persist_dr_cache = 1;
+	  case 'p': /* instrumented PE path */
 
-		  break;
-
-	  case 'P':
-#ifdef INTELPT
-		  use_intelpt = 1;
-#else
-		  FATAL("afl-fuzz was not compiled with Intel PT support");
-#endif
-
+		  if (target_module) FATAL("TODO: Multiple PE support");
+		  target_module = optarg;
+		  _putenv_s(TARGET_VAR, target_module);
 		  break;
 
       case 'c':
@@ -8438,32 +8237,14 @@ int main(int argc, char** argv) {
 
     }
 
-  if (!in_dir || !out_dir || !timeout_given || (!drioless && !dynamorio_dir && !use_intelpt)) usage(argv[0]);
-
-  if (!winafl_dll_path) {
-    winafl_dll_path = "winafl.dll";
-  } else if (expert_mode) {
-    FATAL("-w and -e are mutually exclusive");
-  }
+  if (!in_dir || !out_dir || !target_module)
+	  usage(argv[0]);
 
   setup_signal_handlers();
   check_asan_opts();
 
   if (sync_id) fix_up_sync();
 
-  if (use_intelpt) {
-#ifdef INTELPT
-	  char *modules_dir = alloc_printf("%s\\ptmodules", out_dir);
-	  int pt_options = pt_init(argc - optind, argv + optind, modules_dir);
-	  ck_free(modules_dir);
-	  if (!pt_options) usage(argv[0]);
-	  optind += pt_options;
-#endif
-  } else {
-	  extract_client_params(argc, argv);
-  }
-  optind++;
-  
   if (!strcmp(in_dir, out_dir))
     FATAL("Input and output directories can't be the same");
 
@@ -8503,11 +8284,7 @@ int main(int argc, char** argv) {
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
-  if (use_intelpt) {
-	  trace_bits = VirtualAlloc(0, MAP_SIZE, MEM_COMMIT, PAGE_READWRITE);
-  } else {
-	  setup_shm();
-  }
+  setup_shm();
   
   if (use_sample_shared_memory) {
     setup_sample_shm();

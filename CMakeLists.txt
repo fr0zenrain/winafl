@@ -134,9 +134,6 @@ add_executable(afl-fuzz
 
 if (${INTELPT})
 
-  target_link_libraries(afl-fuzz winipt)
-  target_link_libraries(afl-fuzz libipt)
-
   target_link_libraries(afl-fuzz "psapi.lib")
   target_link_libraries(afl-fuzz "Dbghelp.lib")
 

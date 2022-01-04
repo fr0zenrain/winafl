@@ -51,7 +51,7 @@
 #include <sys/types.h>
 
 static s32 child_pid;                 /* PID of the tested program         */
-
+char *target_module;
 static HANDLE child_handle,
               child_thread_handle;
 static char *dynamorio_dir;
@@ -254,6 +254,7 @@ static void setup_shm(void) {
   if(attempts == 5) {
     FATAL("Could not find a section name.\n");
   }
+  _putenv_s(SHM_ENV_VAR, shm_str);
 
   atexit(remove_shm);
 
@@ -458,7 +459,7 @@ static void create_target_process(char** argv) {
   if (pipe_handle == INVALID_HANDLE_VALUE) {
     FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
   }
-
+  _putenv_s(PIPE_ENV_VAR, pipe_name);
   target_cmd = argv_to_cmd(argv);
 
   ZeroMemory(&si, sizeof(si));
@@ -470,24 +471,6 @@ static void create_target_process(char** argv) {
     si.dwFlags |= STARTF_USESTDHANDLES;
   } else {
     inherit_handles = FALSE;
-  }
-
-  if(drioless) {
-    char *static_config = alloc_printf("%s:1", fuzzer_id);
-
-    if (static_config == NULL) {
-      FATAL("Cannot allocate static_config.");
-    }
-
-    SetEnvironmentVariable("AFL_STATIC_CONFIG", static_config);
-    cmd = alloc_printf("%s", target_cmd);
-    ck_free(static_config);
-  } else {
-    pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
-    cmd = alloc_printf(
-      "%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzz_iterations 1 -fuzzer_id %s -- %s",
-      dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd
-    );
   }
 
   if(mem_limit != 0) {
@@ -510,7 +493,7 @@ static void create_target_process(char** argv) {
     }
   }
 
-  if(!CreateProcess(NULL, cmd, NULL, NULL, inherit_handles, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+  if(!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
     FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
   }
 
@@ -535,31 +518,9 @@ static void create_target_process(char** argv) {
   }
 
   watchdog_enabled = 0;
-
-  if(drioless == 0) {
-    //by the time pipe has connected the pidfile must have been created
-    fp = fopen(pidfile, "rb");
-    if(!fp) {
-      FATAL("Error opening pidfile.txt");
-    }
-    fseek(fp,0,SEEK_END);
-    pidsize = ftell(fp);
-    fseek(fp,0,SEEK_SET);
-    buf = (char *)malloc(pidsize+1);
-    fread(buf, pidsize, 1, fp);
-    buf[pidsize] = 0;
-    fclose(fp);
-    remove(pidfile);
-    child_pid = atoi(buf);
-    free(buf);
-    ck_free(pidfile);
-  }
-  else {
-    child_pid = pi.dwProcessId;
-  }
+  child_pid = pi.dwProcessId;
 
   ck_free(target_cmd);
-  ck_free(cmd);
   ck_free(pipe_name);
 }
 
@@ -578,26 +539,6 @@ static void destroy_target_process(int wait_exit) {
 
   if(WaitForSingleObject(child_handle, wait_exit) != WAIT_TIMEOUT) {
     goto done;
-  }
-
-  // nudge the child process only if dynamorio is used
-  if(drioless) {
-    TerminateProcess(child_handle, 0);
-  } else {
-    kill_cmd = alloc_printf("%s\\drconfig.exe -nudge_pid %d 0 1", dynamorio_dir, child_pid);
-
-    ZeroMemory( &si, sizeof(si) );
-    si.cb = sizeof(si);
-    ZeroMemory( &pi, sizeof(pi) );
-
-    if(!CreateProcess(NULL, kill_cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-      FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    ck_free(kill_cmd);
   }
 
   still_alive = WaitForSingleObject(child_handle, 2000) == WAIT_TIMEOUT;
@@ -673,7 +614,7 @@ static int is_child_running() {
 
 static void run_target(char** argv) {
 
-  char command[] = "F";
+  char command[] = "R";
   DWORD num_read;
   char result = 0;
 
@@ -703,25 +644,14 @@ static void run_target(char** argv) {
   child_timed_out = 0;
   memset(trace_bits, 0, MAP_SIZE);
 
-  //TEMPORARY FIX FOR REGULAR USAGE OF AFL-TMIN
-  ReadFile(pipe_handle, &result, 1, &num_read, NULL);
-  if (result == 'K')
-  {
-	  //a workaround for first cycle
-	  ReadFile(pipe_handle, &result, 1, &num_read, NULL);
-  }
-  if (result != 'P')
-  {
-	  FATAL("Unexpected result from pipe! expected 'P', instead received '%c'\n", result);
-  }
-  //END OF TEMPORARY FIX FOR REGULAR USAGE OF AFL-TMIN
-  WriteFile( 
-    pipe_handle,  // handle to pipe 
-    command,      // buffer to write from 
-    1,            // number of bytes to write 
-    &num_read,    // number of bytes written 
-    NULL);        // not overlapped I/O 
+  WriteFile(
+	  pipe_handle,  // handle to pipe 
+	  command,      // buffer to write from 
+	  1,            // number of bytes to write 
+	  &num_read,    // number of bytes written 
+	  NULL);        // not overlapped I/O 
 
+  //ACTF("[+]Send Command '%s' size=%d\n", command, num_read);
 
   watchdog_timeout_time = get_cur_time() + exec_tmout;
 
@@ -922,7 +852,7 @@ static void extract_client_params(u32 argc, char** argv) {
     len += strlen(argv[i]) + 1;
   }
 
-  if(i == argc) usage(argv[0]);
+  if(i != argc) usage(argv[0]);
   opt_end = i;
 
   buf = client_params = ck_alloc(len);
@@ -942,8 +872,6 @@ static void extract_client_params(u32 argc, char** argv) {
   }
 
   *buf = 0;
-
-  optind = opt_end;
 
 }
 
@@ -966,7 +894,7 @@ int main(int argc, char** argv) {
   enable_ansi_console();
 #endif
 
-  while ((opt = getopt(argc, argv, "+o:m:t:A:D:eqZQbY")) > 0)
+  while ((opt = getopt(argc, argv, "+o:m:t:A:D:eqZQbYdp:")) > 0)
 
     switch (opt) {
 
@@ -981,7 +909,12 @@ int main(int argc, char** argv) {
         if(out_file) FATAL("Multiple -o options not supported");
         out_file = optarg;
         break;
+	  case 'p': /* instrumented PE path */
 
+		  if (target_module) FATAL("TODO: Multiple PE support");
+		  target_module = optarg;
+		  _putenv_s(TARGET_VAR, target_module);
+		  break;
       case 'm': {
 
           u8 suffix = 'M';
@@ -1090,13 +1023,9 @@ int main(int argc, char** argv) {
 
     }
 
-  if(!out_file) usage(argv[0]);
-  if(!drioless) {
-    if(optind == argc || !dynamorio_dir) usage(argv[0]);
-  }
+  if (optind == argc || !out_file|| !target_module) usage(argv[0]);
 
   extract_client_params(argc, argv);
-  optind++;
 
   setup_shm();
   setup_watchdog_timer();
@@ -1108,17 +1037,8 @@ int main(int argc, char** argv) {
 
   if(!quiet_mode) {
     show_banner();
-    // Find the name of the target executable in the arguments
-    for(; i < argc; i++) {
-      if(strcmp(argv[i], "--") == 0) counter++;
-      if(counter == (drioless ? 1:2)) {
-        if(i != (argc - 1)) {
-          target_path = argv[i + 1];
-        }
-        break;
-      }
-    }
-    ACTF("Executing '%s'...\n", target_path);
+
+    ACTF("Executing '%s'...\n", client_params);
   }
 
   detect_file_args(argv + optind);

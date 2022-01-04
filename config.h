@@ -28,6 +28,7 @@
 #define inline __inline
 
 #include "types.h"
+#define TARGET_VAR          "AFL_TARGET"
 
 /******************************************************
  *                                                    *
@@ -274,7 +275,7 @@
 /* Environment variable used to pass SHM ID to the called program. */
 
 #define SHM_ENV_VAR         "__AFL_SHM_ID"
-
+#define PIPE_ENV_VAR        "__AFL_PIPE_ID"
 /* Other less interesting, internal-only variables. */
 
 #define CLANG_ENV_VAR       "__AFL_CLANG_MODE"
